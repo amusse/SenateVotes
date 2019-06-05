@@ -36,7 +36,73 @@ namespace SenateVotes.Models
 
         public string Time { get; set; }
 
-        public string Result { get; set; }
+        private string _result;
+
+        public string Result 
+        { 
+            get 
+            {
+                return _result;
+            } 
+            set 
+            {
+                _result = value;
+                if (value != null)
+                {
+                    _result = value.ToUpper();
+                }
+            }
+        }
+
+        private string _shortResult;
+
+        public string ShortResult 
+        { 
+            get
+            {
+                if (_result != null)
+                {
+                    var res = _result.ToLower();
+                    if (res.Contains("passed"))
+                    {
+                        _shortResult = "PASSED";
+                    }
+                    else if (res.Contains("agreed"))
+                    {
+                        _shortResult = "AGREED";
+                    }
+                    else if (res.Contains("rejected"))
+                    {
+                        _shortResult = "REJECTED";
+                    }
+                    else if (res.Contains("confirmed"))
+                    {
+                        _shortResult = "CONFIRMED";
+                    }
+                    else if (res.Contains("not sustained"))
+                    {
+                        _shortResult = "NOT SUSTAINED";
+                    }
+                    else if (res.Contains("failed"))
+                    {
+                        _shortResult = "FAILED";
+                    }
+                    else if (res.Contains("succeeded"))
+                    {
+                        _shortResult = "SUCCEEDED";
+                    }
+                    else if (res.Contains("veto sustained"))
+                    {
+                        _shortResult = "VETO SUSTAINED";
+                    } 
+                }
+                return _shortResult;
+            } 
+            set
+            {
+                _shortResult = value;
+            } 
+        }
 
         [JsonProperty("tie_breaker")]
         public string TieBreaker { get; set; }

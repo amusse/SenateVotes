@@ -15,9 +15,20 @@ namespace SenateVotes.Models
 
         public string Result { get; set; }
 
-        public Dictionary<string, Member> VotingMembers { get; set; }
+        public IEnumerable<Tuple<Member, Member>> VotingMembers { get; set; }
+
+        public IEnumerable<Member> MemberPositions { get; set; }
 
         public string VoteUrl { get; set; }
 
+        public string TweetText { get; set; }
+
+        public string BillSummary { get; set; }
+
+        public string VoteType { get; set; }
+
+        public string VoteDate { get; set; }
+
+        public string ShortResult { get; set; }
     }
 }

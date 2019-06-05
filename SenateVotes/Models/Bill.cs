@@ -20,5 +20,9 @@ namespace SenateVotes.Models
         [JsonProperty("latest_action")]
         public string LatestAction { get; set; }
 
+        public string Summary { get; set; }
+
+        public string ShortSummary { get; set; }
+
     }
 }
