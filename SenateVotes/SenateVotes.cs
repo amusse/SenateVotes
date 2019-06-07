@@ -17,30 +17,42 @@ using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
 using SixLabors.ImageSharp.Processing;
 using SixLabors.Primitives;
-using SixLabors.Shapes;
 using System.Threading;
 
 namespace SenateVotes
 {
     public static class SenateVotes
     {
+        // TODO: Move these constants to a constants file
+        private const string PRO_PUBLICA_BASE_URL = "PRO_PUBLICA_BASE_URL";
+        private const string PRO_PUBLICA_API_KEY = "PRO_PUBLICA_API_KEY";
+        private const int TIME_TO_WAIT_BETWEEN_TWEETS = 2000; // In milliseconds
+        private const int MAX_TWEET_BODY_LENGTH = 165;
+
         [FunctionName("SenateVotes")]
         public static async Task Run([TimerTrigger("0 0 20 * * *")]TimerInfo myTimer, ILogger log)
         {
             TwitterHelpers.AuthenticateTwitter(log);
-            await GetVotes(log);
+            await TweetVotes(log);
         }
 
-        public static async Task GetVotes(ILogger log)
+        private static async Task TweetVotes(ILogger log)
         {
             // Create a New HttpClient object and dispose it when done, so the app doesn't leak resources
-            using (HttpClient client = new HttpClient() { BaseAddress = new Uri(HelperMethods.GetEnvironmentVariable("PRO_PUBLICA_BASE_URL")) })
+            using (HttpClient client = new HttpClient() { BaseAddress = new Uri(HelperMethods.GetEnvironmentVariable(PRO_PUBLICA_BASE_URL)) })
             {
                 try
                 {
-                    client.DefaultRequestHeaders.Add("X-API-KEY", HelperMethods.GetEnvironmentVariable("PRO_PUBLICA_API_KEY"));
-                    await GetVotesForDate(log, client, DateTime.Now);
+                    client.DefaultRequestHeaders.Add("X-API-KEY", HelperMethods.GetEnvironmentVariable(PRO_PUBLICA_API_KEY));
 
+                    // Get all the votes for the current date
+                    var votes = await GetVotesForDate(log, client, DateTime.Now);
+
+                    // Formulate tweet body for each individual vote
+                    var tweets = await CreateTweets(log, client, votes);
+
+                    // Publish the tweets
+                    PublishTweets(log, tweets);
                 }
                 catch (HttpRequestException e)
                 {
@@ -49,10 +61,12 @@ namespace SenateVotes
             }
         }
 
-        public static async Task GetVotesForDate(ILogger log, HttpClient client, DateTime currentDate)
+        public static async Task<List<Vote>> GetVotesForDate(ILogger log, HttpClient client, DateTime currentDate)
         {
             var uri = $"/congress/v1/senate/votes/{currentDate.Year}/{currentDate.Month}.json";
             var responseBody = await client.GetStringAsync(uri);
+
+            IEnumerable<Vote> votes = new List<Vote>();
             Response res = null;
             try
             {
@@ -61,9 +75,8 @@ namespace SenateVotes
             catch (Exception e)
             {
                 log.LogError($"Exception when deserializing response body. Message: {e.Message}");
-                return;
+                return votes.ToList();
             }
-            IEnumerable<Vote> votes = null;
             if (res != null && res.Results != null && res.Results.Votes != null)
             {
                 votes = res.Results.Votes;
@@ -72,7 +85,7 @@ namespace SenateVotes
             else
             {
                 log.LogInformation($"No votes found in response body for date: {currentDate}. Response: {res}");
-                return;
+                return votes.ToList();
             }
 
             votes = votes.Where(vote =>
@@ -91,15 +104,17 @@ namespace SenateVotes
             });
 
             log.LogInformation($"After filtering by day, retrieved {votes.Count()} total votes for day: {currentDate.Day}");
-            votes = votes.OrderBy(o => o.RollCall).ToList();
+            votes = votes.OrderBy(o => o.RollCall);
+            return votes.ToList();
+        }
 
+        public static async Task<List<Models.Tweet>> CreateTweets(ILogger log, HttpClient client, List<Vote> votes)
+        {
             var tweets = new List<Models.Tweet>();
-            var statesDict = HelperMethods.BuildStateDictionary();
-
             foreach (var vote in votes)
             {
                 var voteUri = vote.VoteUri;
-                uri = voteUri.Replace(HelperMethods.GetEnvironmentVariable("PRO_PUBLICA_BASE_URL"), "");
+                var uri = voteUri.Replace(HelperMethods.GetEnvironmentVariable(PRO_PUBLICA_BASE_URL), "");
                 var voteResp = await client.GetStringAsync(uri);
                 var voteData = JsonConvert.DeserializeObject<dynamic>(voteResp);
                 JArray positionsArray = null;
@@ -110,10 +125,13 @@ namespace SenateVotes
                 catch (Exception e)
                 {
                     log.LogError($"Exception when converting senate positions to JArray. Message: {e.Message}");
-                    return;
+                    return tweets;
                 }
 
                 var memberPositions = positionsArray.ToObject<IEnumerable<Member>>();
+
+                // Create body of tweet
+                var tweetText = CreateTweetText(log, vote, memberPositions);
 
                 var newTweet = new Models.Tweet
                 {
@@ -121,7 +139,7 @@ namespace SenateVotes
                     Result = vote.Result,
                     ShortResult = vote.ShortResult,
                     MemberPositions = memberPositions,
-                    TweetText = CreateTweetText(log, vote, memberPositions),
+                    TweetText = tweetText,
                     VoteUrl = vote.Url,
                     VoteType = vote.VoteType,
                     VoteDate = vote.Date
@@ -130,7 +148,7 @@ namespace SenateVotes
                 if (!string.IsNullOrEmpty(vote.Bill.ApiUri))
                 {
                     var billUri = vote.Bill.ApiUri;
-                    uri = billUri.Replace(HelperMethods.GetEnvironmentVariable("PRO_PUBLICA_BASE_URL"), "");
+                    uri = billUri.Replace(HelperMethods.GetEnvironmentVariable(PRO_PUBLICA_BASE_URL), "");
                     var billResp = await client.GetStringAsync(uri);
                     var billData = JsonConvert.DeserializeObject<dynamic>(billResp);
                     if (billData != null)
@@ -148,34 +166,41 @@ namespace SenateVotes
             }
 
             log.LogInformation($"Number of tweets attempting to be published: {tweets.Count}");
-            var tweetIndex = 0;
-            var publishedTweets = 0;
-            if (tweets.Count > 0)
-            {
-                foreach (var tweet in tweets)
-                {
-                    log.LogInformation($"TweetIndex: {tweetIndex}, VoteUrl: {tweet.VoteUrl}, TweetText: {tweet.TweetText}");
-                    var published = SendTweet(log, tweet, statesDict);
-                    Thread.Sleep(2000);
-                    if (published == true)
-                    {
-                        publishedTweets++;
-                    }
-                    tweetIndex++;
-                }
-            }
-
-            log.LogInformation($"Number of tweets published: {publishedTweets}");
+            return tweets;
         }
 
-        public static string CreateTweetText(ILogger log, Vote vote, IEnumerable<Member> memberPositions)
+        public static void PublishTweets(ILogger log, List<Models.Tweet> tweets)
+        {
+            // Create a mapping between abbreviated state names to full state names
+            var statesDict = HelperMethods.BuildStateDictionary();
+
+            log.LogInformation($"Number of tweets attempting to be published: {tweets.Count}");
+            var tweetIndex = 0;
+            var numPublishedTweets = 0;
+            foreach (var tweet in tweets)
+            {
+                log.LogInformation($"TweetIndex: {tweetIndex}, VoteUrl: {tweet.VoteUrl}, TweetText: {tweet.TweetText}");
+                var didPublish = SendTweet(log, tweet, statesDict);
+
+                // Wait until tweet hits twiter before moving on to the next tweet
+                Thread.Sleep(TIME_TO_WAIT_BETWEEN_TWEETS);
+                if (didPublish == true)
+                {
+                    numPublishedTweets++;
+                }
+                tweetIndex++;
+            }
+            log.LogInformation($"Number of tweets published: {numPublishedTweets}");
+        }
+
+        private static string CreateTweetText(ILogger log, Vote vote, IEnumerable<Member> memberPositions)
         {
             // Format will look like this
-            // {PASSED}{AGREED}{REJECTED}{CONFIRMED} (date) (sponsor name, state, party) : {document_title} {url}
-            var tweetText = "";
+            // PASSED (date) (sponsor name, state, party) : {document_title} {url}
+            var tweetText = string.Empty;
             if (vote.Bill != null && !string.IsNullOrEmpty(vote.Bill.SponsorId))
             {
-                var description = "";
+                var description = string.Empty;
                 if (!string.IsNullOrEmpty(vote.Bill.Title))
                 {
                     description = vote.Bill.Title;
@@ -198,7 +223,7 @@ namespace SenateVotes
                 tweetText = $"{vote.Result} ({vote.Date}): {vote.DocumentTitle}";
             }
 
-            tweetText = HelperMethods.TruncateString(tweetText, 165);
+            tweetText = HelperMethods.TruncateString(tweetText, MAX_TWEET_BODY_LENGTH);
             tweetText = $"{tweetText} {vote.Url}";
 
             if (string.IsNullOrEmpty(tweetText))
@@ -208,15 +233,16 @@ namespace SenateVotes
             return tweetText;
         }
 
-        public static bool SendTweet(ILogger log, Models.Tweet tweet, Dictionary<string, string> statesDict)
+        private static bool SendTweet(ILogger log, Models.Tweet tweet, Dictionary<string, string> statesDict)
         {
-            tweet.VotingMembers = GetMemberVotes(tweet.MemberPositions.ToList(), statesDict);
-            log.LogInformation($"{tweet.VotingMembers.Count()} voting members for tweet.");
+            tweet.VotingMembers = GetMemberVotes(log, tweet.MemberPositions, statesDict);
 
+            // Creates an image of senator voting positions to upload along with the tweet
             var filePath = CreateImage(log, tweet);
             if (!string.IsNullOrEmpty(filePath))
             {
                 byte[] file1 = File.ReadAllBytes(filePath);
+
                 log.LogInformation($"Uploading image for tweet...");
                 var media = Upload.UploadBinary(file1);
                 log.LogInformation($"Image upload complete!");
@@ -233,177 +259,168 @@ namespace SenateVotes
                 }
                 else
                 {
-                    log.LogInformation($"Tweet published! TweeetId: {tweetResponse.Id}");
+                    log.LogInformation($"Tweet published! TweetId: {tweetResponse.Id}");
                     return true;
                 }
             }
             return false;
         }
 
-        public static IEnumerable<Tuple<Member, Member>> GetMemberVotes(IEnumerable<Member> members, Dictionary<string, string> statesDict)
+        private static IEnumerable<Tuple<Member, Member>> GetMemberVotes(ILogger log, IEnumerable<Member> members, Dictionary<string, string> statesDict)
         {
             var memberVotes = new List<Tuple<Member, Member>>();
-
-            if (members.Count() == 100)
+            var numMembers = members.Count();
+            if (numMembers == 100)
             {
-                members = members.Select(c => { c.State = statesDict[c.State]; return c; }).ToList();
+                members = members.Select(c => { c.State = statesDict[c.State]; return c; });
 
                 var sortedMembers = members.OrderBy(o => o.State).ToList();
-                var count = sortedMembers.Count();
+                var count = sortedMembers.Count;
                 for (int i = 0; i < count; i += 2)
                 {
                     var member1 = sortedMembers[i];
                     var member2 = sortedMembers[i + 1];
-
-                    var replyText = $"{member1.State}: {member1.Name} ({member1.Party}) [{member1.VotePosition}], {member2.Name} ({member2.Party}) [{member2.VotePosition}]";
                     memberVotes.Add(Tuple.Create(member1, member2));
                 }
             }
+            log.LogInformation($"{numMembers} voting members for tweet.");
             return memberVotes;
         }
 
-        public static string CreateImage(ILogger log, Models.Tweet tweet)
+        private static Rgba32 GetPartyColor(string party)
+        {
+            switch (party.ToLower())
+            {
+                case "d":
+                    return Rgba32.Blue;
+                case "r":
+                    return Rgba32.Red;
+                case "id":
+                    return Rgba32.Green;
+                default:
+                    return Rgba32.Black;
+            }
+        }
+
+        private static void DrawMemberPositionOnCanvas(Image<Rgba32> img, Font boldFont, Font regularFont, Member member, int horizontalPosition1, int horizontalPosition2, int verticalPosition)
+        {
+            var memberPosition = member.VotePosition.ToLower();
+            var color = GetPartyColor(member.Party);
+            img.Mutate(ctx => ctx.DrawText($"{member.Name}  ({member.Party})", regularFont, color, new PointF(horizontalPosition1, verticalPosition)));
+            img.Mutate(ctx => ctx.DrawText($"{member.VotePosition}", boldFont, Rgba32.Black, new PointF(horizontalPosition2, verticalPosition)));
+        }
+
+        private static string CreateImage(ILogger log, Models.Tweet tweet)
         {
             log.LogInformation($"Creating image for tweet...");
-            var imageWidth = 1230;
-            var imageHeight = 1625;
-            var regularFont = SystemFonts.CreateFont("Arial", 25, FontStyle.Regular);
-            var boldFont = SystemFonts.CreateFont("Arial", 25, FontStyle.Bold);
+
+            // TODO: Move these constants to a constants file
+            var DEFAULT_TWEET_IMAGE_WIDTH = 1230;
+            var DEFAULT_TWEET_IMAGE_HEIGHT = 1625;
+            var DEFAULT_TWEET_IMAGE_FONT_SIZE = 25;
+            var DEFAULT_LINE_HEIGHT = 30;
+            var ESTIMATED_NUMBER_OF_CHARS_PER_LINE = 110;
+            var MEMBER1_NAME_START_X = 225;
+            var MEMBER1_VOTE_START_X = 575;
+            var MEMBER2_NAME_START_X = 725;
+            var MEMBER2_VOTE_START_X = 1075;
+            var VOTE_RESULTS_START_X = 425;
+            var FINAL_RESULT_START_X = 543;
+            var imageWidth = DEFAULT_TWEET_IMAGE_WIDTH;
+            var imageHeight = DEFAULT_TWEET_IMAGE_HEIGHT;
+            var regularFont = SystemFonts.CreateFont("Arial", DEFAULT_TWEET_IMAGE_FONT_SIZE, FontStyle.Regular);
+            var boldFont = SystemFonts.CreateFont("Arial", DEFAULT_TWEET_IMAGE_FONT_SIZE, FontStyle.Bold);
 
             var numberOfLines = 0;
             if (!string.IsNullOrEmpty(tweet.BillSummary))
             {
-                imageHeight += 30;
-                numberOfLines = tweet.BillSummary.Length / 110;
-                imageHeight += numberOfLines * 30;
-                imageHeight += 30;
+                // If there is a bill summary, make additional room for the "Bill Summary:" header, the Bill Summary
+                // text, and a trailing new line on the image canvas
+                numberOfLines = tweet.BillSummary.Length / ESTIMATED_NUMBER_OF_CHARS_PER_LINE;
+                imageHeight += numberOfLines * DEFAULT_LINE_HEIGHT + (DEFAULT_LINE_HEIGHT * 2);
             }
             else if (!string.IsNullOrEmpty(tweet.VoteDescription))
             {
-                imageHeight += 30;
-                numberOfLines = tweet.VoteDescription.Length / 110;
-                imageHeight += numberOfLines * 30;
-                imageHeight += 30;
+                // If there is a vote description, make additional room for the "Vote Description:" header, the Vote Description
+                // text, and a trailing new line on the image canvas
+                numberOfLines = tweet.VoteDescription.Length / ESTIMATED_NUMBER_OF_CHARS_PER_LINE;
+                imageHeight += numberOfLines * DEFAULT_LINE_HEIGHT + (DEFAULT_LINE_HEIGHT * 2);
             }
+
             log.LogInformation($"Image width: {imageWidth} Image height: {imageHeight}");
             using (Image<Rgba32> img = new Image<Rgba32>(imageWidth, imageHeight))
             {
+                // Set the background color of the image to white
                 img.Mutate(ctx => ctx.Fill(Rgba32.White));
 
-                var verticalOffset = 5;
-                var totalYes = 0;
-                var totalNo = 0;
-                var totalNotVoting = 0;
+                // The height to draw on the canvas
+                var y = 5;
 
+                // The width to draw on the canvas
+                var x = 5;
+
+                // Populate image with header text
                 if (!string.IsNullOrEmpty(tweet.BillSummary))
                 {
-                    img.Mutate(ctx => ctx.DrawText($"Bill Summary:", boldFont, Rgba32.Black, new PointF(5, verticalOffset)));
-                    verticalOffset += 30;
+                    img.Mutate(ctx => ctx.DrawText($"Bill Summary:", boldFont, Rgba32.Black, new PointF(x, y)));
                     var textGraphicOptions = new TextGraphicsOptions(true)
                     {
                         HorizontalAlignment = HorizontalAlignment.Left,
                         VerticalAlignment = VerticalAlignment.Top,
                         WrapTextWidth = imageWidth
                     };
-                    img.Mutate(ctx => ctx.DrawText(textGraphicOptions, tweet.BillSummary, regularFont, Rgba32.Black, new PointF(5, verticalOffset)));
-                    verticalOffset += 30 * numberOfLines;
-                    verticalOffset += 30;
+                    y += DEFAULT_LINE_HEIGHT;
+                    img.Mutate(ctx => ctx.DrawText(textGraphicOptions, tweet.BillSummary, regularFont, Rgba32.Black, new PointF(x, y)));
+                    y += DEFAULT_LINE_HEIGHT * numberOfLines + DEFAULT_LINE_HEIGHT;
                 }
                 else if (!string.IsNullOrEmpty(tweet.VoteDescription))
                 {
-                    img.Mutate(ctx => ctx.DrawText($"Vote Description:", boldFont, Rgba32.Black, new PointF(5, verticalOffset)));
-                    verticalOffset += 30;
+                    img.Mutate(ctx => ctx.DrawText($"Vote Description:", boldFont, Rgba32.Black, new PointF(x, y)));
                     var textGraphicOptions = new TextGraphicsOptions(true)
                     {
                         HorizontalAlignment = HorizontalAlignment.Left,
                         VerticalAlignment = VerticalAlignment.Top,
                         WrapTextWidth = imageWidth
                     };
-                    img.Mutate(ctx => ctx.DrawText(textGraphicOptions, tweet.VoteDescription, regularFont, Rgba32.Black, new PointF(5, verticalOffset)));
-                    verticalOffset += 30 * numberOfLines;
-                    verticalOffset += 30;
+                    y += DEFAULT_LINE_HEIGHT;
+                    img.Mutate(ctx => ctx.DrawText(textGraphicOptions, tweet.VoteDescription, regularFont, Rgba32.Black, new PointF(x, y)));
+                    y += DEFAULT_LINE_HEIGHT * numberOfLines + DEFAULT_LINE_HEIGHT;
                 }
+
+                // Populate canvas with senate vote positions
+                var totalYes = 0;
+                var totalNo = 0;
+                var totalNotVoting = 0;
                 foreach (var memberVote in tweet.VotingMembers)
                 {
-                    if (memberVote.Item1.VotePosition.ToLower() == "yes")
-                    {
-                        totalYes += 1;
-                    }
-                    else if (memberVote.Item1.VotePosition.ToLower() == "no")
-                    {
-                        totalNo += 1;
-                    }
-                    else
-                    {
-                        totalNotVoting += 1;
-                    }
+                    var member1 = memberVote.Item1;
+                    var member2 = memberVote.Item2;
+                    img.Mutate(ctx => ctx.DrawText($"{member1.State}:", boldFont, Rgba32.Black, new PointF(x, y)));
 
-                    if (memberVote.Item2.VotePosition.ToLower() == "yes")
-                    {
-                        totalYes += 1;
-                    }
-                    else if (memberVote.Item2.VotePosition.ToLower() == "no")
-                    {
-                        totalNo += 1;
-                    }
-                    else
-                    {
-                        totalNotVoting += 1;
-                    }
+                    var member1Position = member1.VotePosition.ToLower();
+                    // NOTE: _1 variable is unused. Used here so terinary operand can be used to reduce code size
+                    var _1 = member1Position == "yes" ? totalYes += 1 : member1Position == "no" ? totalNo += 1 : totalNotVoting += 1;
 
-                    var verticalPosition = verticalOffset;
-                    var horizontalPosition = 5;
-                    img.Mutate(ctx => ctx.DrawText($"{memberVote.Item1.State}:", boldFont, Rgba32.Black, new PointF(horizontalPosition, verticalPosition)));
+                    var member2Position = member2.VotePosition.ToLower();
+                    // NOTE: _2 variable is unused. Used here so terinary operand can be used to reduce code size
+                    var _2 = member2Position == "yes" ? totalYes += 1 : member2Position == "no" ? totalNo += 1 : totalNotVoting += 1;
 
-                    horizontalPosition = 225;
-                    var color = Rgba32.Black;
-                    switch (memberVote.Item1.Party.ToLower())
-                    {
-                        case "d":
-                            color = Rgba32.Blue;
-                            break;
-                        case "r":
-                            color = Rgba32.Red;
-                            break;
-                        case "id":
-                            color = Rgba32.Green;
-                            break;
-                        default:
-                            color = Rgba32.Black;
-                            break;
-                    }
-                    img.Mutate(ctx => ctx.DrawText($"{memberVote.Item1.Name}  ({memberVote.Item1.Party})", regularFont, color, new PointF(horizontalPosition, verticalPosition)));
+                    // Draw Member 1 results on canvas
+                    DrawMemberPositionOnCanvas(img, boldFont, regularFont, member1, MEMBER1_NAME_START_X, MEMBER1_VOTE_START_X, y);
 
-                    horizontalPosition = 575;
-                    img.Mutate(ctx => ctx.DrawText($"{memberVote.Item1.VotePosition}", boldFont, Rgba32.Black, new PointF(horizontalPosition, verticalPosition)));
-                    switch (memberVote.Item2.Party.ToLower())
-                    {
-                        case "d":
-                            color = Rgba32.Blue;
-                            break;
-                        case "r":
-                            color = Rgba32.Red;
-                            break;
-                        case "id":
-                            color = Rgba32.Green;
-                            break;
-                        default:
-                            color = Rgba32.Black;
-                            break;
-                    }
-                    horizontalPosition = 725;
-                    img.Mutate(ctx => ctx.DrawText($"{memberVote.Item2.Name}  ({memberVote.Item2.Party})", regularFont, color, new PointF(horizontalPosition, verticalPosition)));
+                    // Draw Member 2 results on canvas
+                    DrawMemberPositionOnCanvas(img, boldFont, regularFont, member2, MEMBER2_NAME_START_X, MEMBER2_VOTE_START_X, y);
 
-                    horizontalPosition = 1075;
-                    img.Mutate(ctx => ctx.DrawText($"{memberVote.Item2.VotePosition}", boldFont, Rgba32.Black, new PointF(horizontalPosition, verticalPosition)));
-
-                    verticalOffset += 30;
+                    y += DEFAULT_LINE_HEIGHT;
                 }
 
-                img.Mutate(ctx => ctx.DrawText($"Yes: {totalYes}     No: {totalNo}     Not Voting: {totalNotVoting}", boldFont, Rgba32.Black, new PointF(425, verticalOffset + 30)));
-                verticalOffset += 30;
-                img.Mutate(ctx => ctx.DrawText($"Majority Position Required: {tweet.VoteType}", boldFont, Rgba32.Black, new PointF(425, verticalOffset + 30)));
-                verticalOffset += 30;
+                // Populate canvas with vote results
+                y += DEFAULT_LINE_HEIGHT;
+                img.Mutate(ctx => ctx.DrawText($"Yes: {totalYes}     No: {totalNo}     Not Voting: {totalNotVoting}", boldFont, Rgba32.Black, new PointF(VOTE_RESULTS_START_X, y)));
+                y += DEFAULT_LINE_HEIGHT;
+                img.Mutate(ctx => ctx.DrawText($"Majority Position Required: {tweet.VoteType}", boldFont, Rgba32.Black, new PointF(VOTE_RESULTS_START_X, y)));
+                y += DEFAULT_LINE_HEIGHT;
+
                 var resultColor = Rgba32.Black;
                 switch (tweet.ShortResult)
                 {
@@ -423,23 +440,30 @@ namespace SenateVotes
                         resultColor = Rgba32.Black;
                         break;
                 }
-                img.Mutate(ctx => ctx.DrawText($"{tweet.ShortResult}", boldFont, resultColor, new PointF(543, verticalOffset + 30)));
 
-                var filePath = "./tweet-image.png";
-                try
-                {
-                    img.Save(filePath);
-                }
-                catch (Exception e)
-                {
-                    log.LogError($"Exception when saving image for tweet. File path: {filePath}. Message: {e.Message}");
-                    return string.Empty;
+                img.Mutate(ctx => ctx.DrawText($"{tweet.ShortResult}", boldFont, resultColor, new PointF(FINAL_RESULT_START_X, y)));
 
-                }
-                log.LogInformation($"Saved image for tweet. File path: {filePath}");
-                return filePath;
+                // Save as image
+                return SaveImage(log, img);
             }
         }
 
+        private static string SaveImage(ILogger log, Image<Rgba32> img)
+        {
+
+            var filePath = "D:\\home\\site\\wwwroot\\SenateVotes\\tweet-image.png";
+            try
+            {
+                img.Save(filePath);
+            }
+            catch (Exception e)
+            {
+                log.LogError($"Exception when saving image for tweet. File path: {filePath}. Message: {e.Message}");
+                return string.Empty;
+
+            }
+            log.LogInformation($"Saved image for tweet. File path: {filePath}");
+            return filePath;
+        }
     }
 }
